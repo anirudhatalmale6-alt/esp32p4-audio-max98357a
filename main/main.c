@@ -139,6 +139,8 @@ static esp_err_t i2s_init(const wav_info_t *wav)
 
     /* Step 1: Allocate TX channel */
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
+    chan_cfg.auto_clear_after_cb = true;   /* Zero DMA buffers after TX done — prevents stale data noise */
+    chan_cfg.auto_clear_before_cb = true;  /* Zero DMA buffers before filling — clean start */
     ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &tx_handle, NULL));
 
     /* Step 2: Configure standard mode (Philips) */
@@ -204,17 +206,21 @@ static esp_err_t play_wav(const wav_info_t *wav)
 }
 
 /**
- * Send silence to flush the DMA buffers after playback.
+ * Flush DMA buffers with silence, then disable the I2S channel to stop all output.
+ * This prevents stale audio data from replaying as noise between playbacks.
  */
-static void flush_i2s(void)
+static void stop_playback(void)
 {
-    uint8_t silence[512];
+    /* Write enough silence to flush all DMA descriptors (default: 6 x 240 frames) */
+    uint8_t silence[1024];
     memset(silence, 0, sizeof(silence));
     size_t written;
-    /* Write a few buffers of silence to ensure all audio data is clocked out */
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 8; i++) {
         i2s_channel_write(tx_handle, silence, sizeof(silence), &written, portMAX_DELAY);
     }
+
+    /* Disable the channel — stops the I2S clock and all output */
+    i2s_channel_disable(tx_handle);
 }
 
 /* ── Main ──────────────────────────────────────────────────────────────── */
@@ -246,7 +252,7 @@ void app_main(void)
     ESP_LOGI(TAG, "Playing beep...");
     ret = play_wav(&wav);
     if (ret == ESP_OK) {
-        flush_i2s();
+        stop_playback();
         ESP_LOGI(TAG, "Playback complete!");
     }
 
@@ -254,7 +260,8 @@ void app_main(void)
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(2000));
         ESP_LOGI(TAG, "Playing beep...");
+        i2s_channel_enable(tx_handle);   /* Re-enable before playing */
         play_wav(&wav);
-        flush_i2s();
+        stop_playback();                 /* Flush + disable after playing */
     }
 }
