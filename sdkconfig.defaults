@@ -1,0 +1,8 @@
+# ESP32-P4 Audio Player - Default Configuration
+# Target is set via: idf.py set-target esp32p4
+
+# Increase main task stack for audio processing
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=4096
+
+# Enable logging
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
