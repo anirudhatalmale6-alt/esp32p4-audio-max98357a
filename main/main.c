@@ -20,6 +20,25 @@
 
 static const char *TAG = "audio_player";
 
+/* ── Volume Control ────────────────────────────────────────────────────── */
+static volatile uint8_t volume_level = 80;  /* 0 (mute) to 100 (max) */
+
+/**
+ * Set playback volume. Range: 0 (mute) to 100 (full volume).
+ * Can be called from any task at any time — takes effect on the next audio chunk.
+ */
+void audio_set_volume(uint8_t level)
+{
+    if (level > 100) level = 100;
+    volume_level = level;
+    ESP_LOGI(TAG, "Volume set to %d%%", level);
+}
+
+uint8_t audio_get_volume(void)
+{
+    return volume_level;
+}
+
 /* ── I2S Pin Configuration ─────────────────────────────────────────────── */
 #define I2S_LRC_GPIO    GPIO_NUM_15   /* Word Select (LR Clock) */
 #define I2S_BCLK_GPIO   GPIO_NUM_14   /* Bit Clock */
@@ -180,19 +199,49 @@ static esp_err_t i2s_init(const wav_info_t *wav)
 }
 
 /**
- * Play the PCM data from a parsed WAV file through I2S.
+ * Apply volume scaling to 16-bit PCM samples in a buffer.
+ * Uses fixed-point multiplication (vol 0-100 → scale 0-256) for efficiency.
+ */
+static void apply_volume_16bit(const uint8_t *src, uint8_t *dst, size_t bytes, uint8_t vol)
+{
+    const int16_t *in  = (const int16_t *)src;
+    int16_t       *out = (int16_t *)dst;
+    size_t num_samples = bytes / sizeof(int16_t);
+    uint32_t scale = (uint32_t)vol * 256 / 100;  /* 0-256 fixed point */
+
+    for (size_t i = 0; i < num_samples; i++) {
+        out[i] = (int16_t)(((int32_t)in[i] * scale) >> 8);
+    }
+}
+
+/**
+ * Play the PCM data from a parsed WAV file through I2S with volume control.
  */
 static esp_err_t play_wav(const wav_info_t *wav)
 {
     const size_t chunk_size = 1024;  /* Write in 1KB chunks */
+    uint8_t scaled_buf[1024];        /* Temp buffer for volume-scaled data */
     size_t remaining = wav->data_size;
     const uint8_t *ptr = wav->data;
 
     while (remaining > 0) {
         size_t to_write = (remaining < chunk_size) ? remaining : chunk_size;
         size_t bytes_written = 0;
+        uint8_t vol = volume_level;
 
-        esp_err_t ret = i2s_channel_write(tx_handle, ptr, to_write, &bytes_written, portMAX_DELAY);
+        /* Apply volume scaling (currently supports 16-bit; other depths pass through) */
+        const uint8_t *write_ptr;
+        if (wav->bits_per_sample == 16 && vol < 100) {
+            apply_volume_16bit(ptr, scaled_buf, to_write, vol);
+            write_ptr = scaled_buf;
+        } else if (vol == 0) {
+            memset(scaled_buf, 0, to_write);
+            write_ptr = scaled_buf;
+        } else {
+            write_ptr = ptr;  /* Full volume or non-16-bit: pass through unchanged */
+        }
+
+        esp_err_t ret = i2s_channel_write(tx_handle, write_ptr, to_write, &bytes_written, portMAX_DELAY);
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "I2S write error: %s", esp_err_to_name(ret));
             return ret;
@@ -248,20 +297,28 @@ void app_main(void)
         return;
     }
 
-    /* Play the beep once */
-    ESP_LOGI(TAG, "Playing beep...");
-    ret = play_wav(&wav);
-    if (ret == ESP_OK) {
+    /* Demo: play the beep at decreasing volume levels */
+    uint8_t demo_volumes[] = {100, 70, 40, 20, 10};
+    for (int i = 0; i < sizeof(demo_volumes); i++) {
+        audio_set_volume(demo_volumes[i]);
+        ESP_LOGI(TAG, "Playing beep at %d%% volume...", demo_volumes[i]);
+
+        if (i > 0) {
+            i2s_channel_enable(tx_handle);
+        }
+        play_wav(&wav);
         stop_playback();
-        ESP_LOGI(TAG, "Playback complete!");
+
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 
-    /* Optional: loop playback every 2 seconds */
+    /* Then loop at default volume */
+    audio_set_volume(80);
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(2000));
-        ESP_LOGI(TAG, "Playing beep...");
-        i2s_channel_enable(tx_handle);   /* Re-enable before playing */
+        ESP_LOGI(TAG, "Playing beep at %d%% volume...", audio_get_volume());
+        i2s_channel_enable(tx_handle);
         play_wav(&wav);
-        stop_playback();                 /* Flush + disable after playing */
+        stop_playback();
     }
 }
